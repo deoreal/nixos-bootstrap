@@ -30,5 +30,8 @@ Existing users, passwords and settings stay as they are.
 ## Controller keys
 
 `keys/*.pub` are the public keys of the machines allowed to manage the systems (one file per
-controller). To manage from another machine, add its public key here **and** in `nixos-config/keys/`.
+controller). To manage from another machine, add its public key here **and** in `nixos-config/keys/`,
+and its fingerprint to each controller's trusted key list (see the nixos-config README). The
+controller's `add-host.sh` refuses a machine on which this script installed a key that isn't on
+that list, so a tampered copy of this repo can't slip in another key.
 Only public keys belong in this repo; it is public.
