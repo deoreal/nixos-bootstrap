@@ -3,9 +3,14 @@
 #
 # Adds /etc/nixos/bootstrap.nix (imported from configuration.nix) which:
 #   - enables flakes and SSH,
-#   - creates the `deploy` user, reachable with the keys in ./keys, with passwordless sudo,
+#   - creates the `builder` user (keys in ./keys/builder, no sudo): the controller syncs and
+#     builds the configuration as this user,
+#   - creates the `deploy` user (keys in ./keys/deploy, passwordless sudo): activates it. Hardware
+#     token keys (sk-*) are only accepted with the token's PIN check (verify-required),
 #   - installs git and rsync.
-# Then runs `nixos-rebuild switch` and prints what the controller needs to onboard this machine.
+# Then runs `nixos-rebuild switch` and prints what the controller needs to onboard this machine,
+# including the fingerprints of the keys it installed, for the user to compare with the
+# controller's trusted list.
 #
 # Usage: sudo ./bootstrap.sh [hostname]
 set -euo pipefail
@@ -14,7 +19,6 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 NIXOS_DIR=/etc/nixos
 CONFIG="$NIXOS_DIR/configuration.nix"
 MODULE="$NIXOS_DIR/bootstrap.nix"
-DEPLOY_USER=deploy
 
 die() {
   echo "error: $*" >&2
@@ -30,18 +34,25 @@ if [ -n "$hostname_arg" ] && ! [[ "$hostname_arg" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9
   die "invalid hostname '$hostname_arg' (use lowercase letters, digits and dashes)"
 fi
 
-# Collect controller public keys.
+# Collect the public keys of one keys/<role>/ folder as Nix list items. Token keys (sk-*) for
+# deploy get the verify-required option, so the host insists on the token's PIN check.
 shopt -s nullglob
-key_lines=""
-for f in "$REPO_DIR"/keys/*.pub; do
-  while IFS= read -r line || [ -n "$line" ]; do
-    [ -z "$line" ] && continue
-    [[ "$line" =~ ^(ssh-|ecdsa-|sk-)[A-Za-z0-9@.-]+\ [A-Za-z0-9+/=]+(\ [^\"\$\\]*)?$ ]] \
-      || die "unexpected line in $f: $line"
-    key_lines+="        \"$line\""$'\n'
-  done <"$f"
-done
-[ -n "$key_lines" ] || die "no public keys found in $REPO_DIR/keys"
+collect_keys() {
+  local role=$1 f line out=""
+  for f in "$REPO_DIR"/keys/"$role"/*.pub; do
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -z "$line" ] && continue
+      [[ "$line" =~ ^(ssh-|ecdsa-|sk-)[A-Za-z0-9@.-]+\ [A-Za-z0-9+/=]+(\ [^\"\$\\]*)?$ ]] \
+        || die "unexpected line in $f: $line"
+      if [ "$role" = deploy ] && [[ "$line" == sk-* ]]; then line="verify-required $line"; fi
+      out+="        \"$line\""$'\n'
+    done <"$f"
+  done
+  [ -n "$out" ] || die "no public keys found in $REPO_DIR/keys/$role"
+  printf '%s' "$out"
+}
+builder_keys="$(collect_keys builder)"
+deploy_keys="$(collect_keys deploy)"
 
 hostname_line=""
 if [ -n "$hostname_arg" ]; then
@@ -58,17 +69,25 @@ cat >"$MODULE" <<EOF
 
   services.openssh.enable = true;
 
-  users.users.$DEPLOY_USER = {
+  users.users.builder = {
     isNormalUser = true;
-    description = "Remote management (nixos-config)";
+    description = "Builds nixos-config, reads state (no sudo)";
+    extraGroups = [ "systemd-journal" ];
+    openssh.authorizedKeys.keys = [
+$builder_keys    ];
+  };
+
+  users.users.deploy = {
+    isNormalUser = true;
+    description = "Activates nixos-config (hardware tokens, sudo)";
     extraGroups = [ "wheel" ];
     openssh.authorizedKeys.keys = [
-$key_lines    ];
+$deploy_keys    ];
   };
 
   security.sudo.extraRules = [
     {
-      users = [ "$DEPLOY_USER" ];
+      users = [ "deploy" ];
       commands = [ { command = "ALL"; options = [ "NOPASSWD" ]; } ];
     }
   ];
@@ -102,6 +121,15 @@ cat <<EOF
     stateVersion: ${state_version:-unknown}
     addresses:    $(echo "$addresses" | paste -sd ' ' -)
 
+    Keys installed (compare with the trusted list on the controller before onboarding):
+EOF
+for f in "$REPO_DIR"/keys/*/*.pub; do
+  printf '      %-8s %s  %s\n' "$(basename "$(dirname "$f")")" "$(ssh-keygen -lf "$f" | awk '{print $2}')" "$(basename "$f")"
+done
+cat <<EOF
+    This machine's host key (compare on the controller after the first connection):
+      $(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $2}')
+
 On the controller, in the nixos-config repo, run (or ask Claude to):
-    scripts/add-host.sh $name $DEPLOY_USER@$(echo "$addresses" | head -n1)
+    scripts/add-host.sh $name $(echo "$addresses" | head -n1)
 EOF
